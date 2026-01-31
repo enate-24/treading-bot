@@ -79,5 +79,4 @@ pytest -m property
 
 ## License
 
-MIT License - see LICENSE file for details."# trading-bot" 
-"# treading-bot" 
+MIT License - see LICENSE file for details.
