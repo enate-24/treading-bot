@@ -19,7 +19,7 @@ class ExchangeConfig:
     name: str
     api_key: str
     api_secret: str
-    sandbox: bool = True
+    sandbox: bool = False
     rate_limit: int = 100
     timeout: int = 30
     priority: int = 1

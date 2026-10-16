@@ -130,3 +130,64 @@ data/
 *.sqlite
 api_keys.json
 .secrets
+
+# Auto-generated docs and guide files
+*.txt
+*.bat
+HOW_TO_*.md
+START_*.md
+QUICK_*.md
+FIX_*.md
+WEB_INTERFACE_*.md
+*_GUIDE.md
+*_FIXED.md
+*_FIXED.txt
+*_SOLUTION.md
+*_SOLUTION.txt
+*_SUMMARY.md
+*_SUMMARY.txt
+*_COMPLETE.md
+*_COMPLETE.txt
+*_ACTIVE.txt
+*_RUNNING.txt
+*_READY.txt
+*_ADDED.txt
+*_ADDED.md
+COMPLETE_SYSTEM_GUIDE.md
+BOT_DOCUMENTATION.md
+ENHANCED_ACCURACY_GUIDE.md
+ROOT_CAUSE_AND_SOLUTION.md
+MARKET_*.md
+SESSION_*.md
+NO_*.md
+NO_*.txt
+WHY_*.md
+WHICH_*.md
+WHICH_*.txt
+MONITORING_GUIDE.md
+METATRADER_GUIDE.md
+INDICATORS_GUIDE.md
+HFT_GUIDE.md
+PROJECT_FILES.md
+GOLD_WARNING.txt
+XAUUSD_ADDED.md
+SYMBOL_*.md
+REBUILD_*.bat
+RESTART_*.bat
+TEST_*.bat
+START_HERE*.md
+START_HERE*.txt
+START_SCRIPTS_QUICK_REFERENCE.txt
+
+# Null file (Windows artifact)
+$null
+
+# VS Code settings
+.vscode/
+
+# Node
+node_modules/
+**/node_modules/
+
+# Web interface build artifacts
+web-interface/build/

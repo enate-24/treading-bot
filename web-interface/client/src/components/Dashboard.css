@@ -1,0 +1,489 @@
+.dashboard {
+  padding: 0;
+}
+
+.dashboard-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 30px;
+  padding: 20px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.dashboard-header h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  color: #ffffff;
+  margin: 0;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+}
+
+.config-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  font-size: 0.9rem;
+  color: #cccccc;
+}
+
+.config-toggle input[type="checkbox"] {
+  margin-right: 8px;
+}
+
+/* Metric Cards */
+.metric-card {
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.metric-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, #00ff88, #00cc6a);
+}
+
+.metric-header {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 15px;
+}
+
+.metric-icon {
+  width: 20px;
+  height: 20px;
+}
+
+.metric-title {
+  font-size: 0.9rem;
+  color: #cccccc;
+  font-weight: 500;
+}
+
+.metric-value {
+  font-size: 2rem;
+  font-weight: 700;
+  margin-bottom: 8px;
+  line-height: 1;
+}
+
+.metric-change {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: #888888;
+}
+
+/* Chart */
+.chart-container {
+  height: 250px;
+  margin-top: 15px;
+}
+
+.chart-legend {
+  display: flex;
+  gap: 15px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: #cccccc;
+}
+
+.legend-color {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+/* Signals */
+.signal-count {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9rem;
+  color: #cccccc;
+}
+
+.signals-list {
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.signal-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px;
+  margin-bottom: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 8px;
+  border-left: 3px solid transparent;
+  transition: all 0.3s ease;
+}
+
+.signal-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.signal-direction {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.signal-direction.buy {
+  color: #00ff88;
+  border-left-color: #00ff88;
+}
+
+.signal-direction.sell {
+  color: #ff4444;
+  border-left-color: #ff4444;
+}
+
+.signal-symbol {
+  font-weight: 500;
+  color: #ffffff;
+}
+
+.signal-time {
+  font-size: 0.8rem;
+  color: #888888;
+}
+
+.no-signals {
+  text-align: center;
+  padding: 40px 20px;
+  color: #888888;
+}
+
+.no-signals-icon {
+  margin-bottom: 10px;
+  opacity: 0.5;
+}
+
+.no-signals p {
+  margin-bottom: 5px;
+  font-weight: 500;
+}
+
+.no-signals small {
+  font-size: 0.8rem;
+}
+
+/* Status */
+.status-details {
+  space-y: 12px;
+}
+
+.status-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.status-item:last-child {
+  border-bottom: none;
+}
+
+.status-label {
+  font-size: 0.9rem;
+  color: #888888;
+}
+
+.status-value {
+  font-weight: 500;
+  color: #ffffff;
+}
+
+.error-indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #ff4444;
+  font-size: 0.9rem;
+}
+
+/* Messages */
+.messages-list {
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.message-item {
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  border-left: 3px solid;
+}
+
+.message-success {
+  background: rgba(0, 255, 136, 0.1);
+  border-left-color: #00ff88;
+}
+
+.message-error {
+  background: rgba(255, 68, 68, 0.1);
+  border-left-color: #ff4444;
+}
+
+.message-info {
+  background: rgba(68, 136, 255, 0.1);
+  border-left-color: #4488ff;
+}
+
+.message-content {
+  font-size: 0.9rem;
+  color: #ffffff;
+  margin-bottom: 4px;
+}
+
+.message-time {
+  font-size: 0.8rem;
+  color: #888888;
+}
+
+.no-messages {
+  text-align: center;
+  padding: 20px;
+  color: #888888;
+}
+
+/* No data states */
+.no-data-chart {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 250px;
+  text-align: center;
+  color: #888888;
+}
+
+.no-data-icon {
+  margin-bottom: 15px;
+  opacity: 0.5;
+}
+
+.no-data-chart p {
+  margin-bottom: 5px;
+  font-weight: 500;
+  color: #cccccc;
+}
+
+.no-data-chart small {
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .dashboard-header {
+    flex-direction: column;
+    gap: 15px;
+    align-items: stretch;
+  }
+  
+  .header-actions {
+    justify-content: space-between;
+  }
+  
+  .metric-value {
+    font-size: 1.5rem;
+  }
+}
+
+/* Symbol Statistics Table */
+.symbol-count {
+  font-size: 0.9rem;
+  color: #888888;
+}
+
+.symbol-stats-table {
+  overflow-x: auto;
+  margin-top: 15px;
+}
+
+.symbol-stats-table table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.symbol-stats-table thead {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.symbol-stats-table th {
+  padding: 12px;
+  text-align: left;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #cccccc;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+}
+
+.symbol-stats-table td {
+  padding: 12px;
+  font-size: 0.9rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.symbol-stats-table tbody tr {
+  transition: background 0.2s ease;
+}
+
+.symbol-stats-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.symbol-stats-table .profit-row {
+  border-left: 3px solid #00ff88;
+}
+
+.symbol-stats-table .loss-row {
+  border-left: 3px solid #ff4444;
+}
+
+.symbol-name {
+  font-weight: 600;
+  color: #ffffff;
+}
+
+.win-rate {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.win-rate.good {
+  background: rgba(0, 255, 136, 0.2);
+  color: #00ff88;
+}
+
+.win-rate.medium {
+  background: rgba(255, 187, 0, 0.2);
+  color: #ffbb00;
+}
+
+.win-rate.bad {
+  background: rgba(255, 68, 68, 0.2);
+  color: #ff4444;
+}
+
+.wins-losses {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.wins {
+  color: #00ff88;
+  font-weight: 600;
+}
+
+.losses {
+  color: #ff4444;
+  font-weight: 600;
+}
+
+.separator {
+  color: #666666;
+}
+
+.profit {
+  color: #00ff88;
+  font-weight: 600;
+}
+
+.loss {
+  color: #ff4444;
+  font-weight: 600;
+}
+
+.avg-win {
+  color: #00ff88;
+}
+
+.avg-loss {
+  color: #ff4444;
+}
+
+.profit-factor {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.profit-factor.good {
+  background: rgba(0, 255, 136, 0.2);
+  color: #00ff88;
+}
+
+.profit-factor.bad {
+  background: rgba(255, 68, 68, 0.2);
+  color: #ff4444;
+}
+
+.no-data {
+  text-align: center;
+  padding: 40px 20px;
+  color: #888888;
+}
+
+.no-data .no-data-icon {
+  margin-bottom: 15px;
+  opacity: 0.5;
+}
+
+.no-data p {
+  margin-bottom: 5px;
+  font-weight: 500;
+  color: #cccccc;
+}
+
+.no-data small {
+  font-size: 0.8rem;
+}
+
+/* Responsive table */
+@media (max-width: 1024px) {
+  .symbol-stats-table {
+    font-size: 0.85rem;
+  }
+  
+  .symbol-stats-table th,
+  .symbol-stats-table td {
+    padding: 8px;
+  }
+}

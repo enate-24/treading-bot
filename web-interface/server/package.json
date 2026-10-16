@@ -1,0 +1,23 @@
+{
+  "name": "hft-monitor-server",
+  "version": "1.0.0",
+  "description": "Node.js backend for HFT trading monitor",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "cors": "^2.8.5",
+    "fs-extra": "^11.1.1",
+    "chokidar": "^3.5.3",
+    "node-cron": "^3.0.2",
+    "csv-parser": "^3.0.0",
+    "moment": "^2.29.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}

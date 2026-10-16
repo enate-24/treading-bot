@@ -35,17 +35,32 @@ class ConfigurationManager(IConfigurationManager):
             environment: Current environment (development, staging, production)
         """
         self.logger = logging.getLogger(__name__)
-        self.config_dir = Path(config_dir)
+        
+        # Handle both directory and file paths
+        config_path = Path(config_dir)
+        if config_path.suffix in ['.json', '.yaml', '.yml']:
+            # It's a file path, extract directory
+            self.config_dir = config_path.parent
+            self.config_file = config_path
+        else:
+            # It's a directory path
+            self.config_dir = config_path
+            self.config_file = None
+        
         self.environment = environment
         self.constraints = ConfigurationConstraints()
         
         # Create config directory if it doesn't exist
-        self.config_dir.mkdir(exist_ok=True)
+        self.config_dir.mkdir(parents=True, exist_ok=True)
         
         # Configuration storage
         self.current_config: Dict[str, Any] = {}
         self.config_history: List[ConfigurationVersion] = []
         self.version_counter = 0
+        
+        # Load config if file path was provided
+        if self.config_file and self.config_file.exists():
+            self.load_from_file(str(self.config_file))
         
         # Encryption key for sensitive data
         self._encryption_key = self._load_or_create_encryption_key()
@@ -395,7 +410,7 @@ class ConfigurationManager(IConfigurationManager):
                     "name": "binance",
                     "api_key": "your_api_key_here",
                     "api_secret": "your_api_secret_here",
-                    "sandbox": True,
+                    "sandbox": False,
                     "rate_limit": 100,
                     "timeout": 30,
                     "priority": 1
