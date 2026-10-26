@@ -3,6 +3,7 @@ Enhanced HFT Trading Bot with improved accuracy.
 """
 import MetaTrader5 as mt5
 import logging
+import os
 import time
 import numpy as np
 from datetime import datetime, timedelta
@@ -10,6 +11,16 @@ from decimal import Decimal
 from typing import Dict, Optional
 import signal
 import sys
+import asyncio
+
+from dotenv import load_dotenv
+
+# Minimum bars of history before signals are trusted
+MIN_BARS_WARMUP = 50
+# Halt new orders after this many consecutive failures (circuit breaker)
+CIRCUIT_BREAKER_THRESHOLD = 10
+RECONNECT_DELAY = 30
+MAX_RECONNECT_ATTEMPTS = 5
 
 # Setup logging
 logging.basicConfig(
@@ -30,6 +41,11 @@ from trading_bot.session_manager import SessionManager
 from trading_bot.performance_monitor import PerformanceMonitor
 from trading_bot.models.core import MarketData, OHLCV, TradingSignal, ExecutedTrade
 from trading_bot.models.enums import SignalDirection, OrderSide
+from trading_bot.utils.indicators import (
+    calculate_ema, calculate_rsi, calculate_macd,
+    calculate_adx, calculate_atr, calculate_stochastic,
+    calculate_cci, calculate_bollinger_bands,
+)
 
 class EnhancedBot:
     """Enhanced trading bot with improved accuracy."""
@@ -51,11 +67,23 @@ class EnhancedBot:
         
         logger.info(f"[OK] Configuration loaded from {config_path}")
         
+        # Load credentials from environment variables (Bug 7 fix)
+        load_dotenv()
+        try:
+            mt5_account = int(os.environ["MT5_ACCOUNT"])
+            mt5_password = os.environ["MT5_PASSWORD"]
+            mt5_server = os.environ["MT5_SERVER"]
+        except KeyError as e:
+            raise EnvironmentError(
+                f"Missing required environment variable: {e}. "
+                "Set MT5_ACCOUNT, MT5_PASSWORD, and MT5_SERVER in your .env file or environment."
+            )
+        
         # Initialize components
         self.mt_connector = MetaTraderConnector(
-            account=config_dict['metatrader']['account'],
-            password=config_dict['metatrader']['password'],
-            server=config_dict['metatrader']['server'],
+            account=mt5_account,
+            password=mt5_password,
+            server=mt5_server,
             mt_version=config_dict['metatrader'].get('version', 5)
         )
         self.enhanced_strategy = EnhancedHFTStrategy(
@@ -68,13 +96,14 @@ class EnhancedBot:
         
         # Trading state
         self.running = False
-        self.open_positions: Dict[str, dict] = {}  # Key: "symbol_timestamp"
-        self.position_counter: Dict[str, int] = {}  # Track position count per symbol
+        self.open_positions: Dict[str, dict] = {}
+        self.position_counter: Dict[str, int] = {}
         self.signal_count = 0
         self.trade_count = 0
         self.win_count = 0
         self.loss_count = 0
-        
+        self._consecutive_failures = 0  # circuit breaker
+
         # Register signal handlers
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
@@ -82,54 +111,131 @@ class EnhancedBot:
         logger.info("[OK] Enhanced HFT Strategy loaded")
         logger.info("[OK] Multi-layer signal analysis enabled")
         logger.info("[OK] Dynamic risk management active")
+
+    # ------------------------------------------------------------------
+    # Broker position sync
+    # ------------------------------------------------------------------
+
+    def _sync_positions_from_broker(self) -> None:
+        """Populate open_positions from any already-open MT5 positions on startup."""
+        try:
+            positions = self.mt_connector.get_positions()
+            if not positions:
+                logger.info("[OK] No existing positions on broker")
+                return
+
+            symbols = list(self.config.trading.symbols)
+            for pos in positions:
+                symbol = pos['symbol']
+                if symbol not in symbols:
+                    continue
+                key = str(pos['ticket'])
+                self.open_positions[key] = {
+                    'symbol': symbol,
+                    'order_id': pos['ticket'],
+                    'direction': SignalDirection.BUY if pos['type'] == 'BUY' else SignalDirection.SELL,
+                    'volume': pos['volume'],
+                    'entry_price': pos['price_open'],
+                    'sl': pos['sl'],
+                    'tp': pos['tp'],
+                    'timestamp': datetime.now(),
+                    'confidence': 0.0,
+                    'synced_from_broker': True,
+                }
+                if symbol not in self.position_counter:
+                    self.position_counter[symbol] = 0
+                self.position_counter[symbol] += 1
+                logger.info(f"[SYNC] Loaded existing {pos['type']} {symbol} ticket={pos['ticket']}")
+
+            logger.info(f"[OK] Synced {len(self.open_positions)} position(s) from broker")
+        except Exception as e:
+            logger.error(f"Error syncing positions: {e}")
     
+    def _run_async(self, coro):
+        """Run an async coroutine from synchronous code."""
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+                # Already inside a running loop — run in a thread
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, coro)
+                    return future.result()
+            except RuntimeError:
+                # No running loop — safe to create one
+                return asyncio.run(coro)
+        except Exception as e:
+            logger.error(f"Error running async call: {e}")
+            return None
+
+    def _get_account_info_sync(self):
+        """Synchronous wrapper for the async get_account_info coroutine."""
+        return self._run_async(self.mt_connector.get_account_info())
+
+    def _get_market_data_sync(self, symbol: str, timeframe: str, bars: int = 200):
+        """Synchronous wrapper for the async get_market_data coroutine."""
+        return self._run_async(self.mt_connector.get_market_data(symbol, timeframe, bars=bars))
+
     def calculate_position_size(self, symbol: str, signal) -> float:
         """Calculate dynamic position size based on confidence and volatility."""
-        account_info = self.mt_connector.get_account_info()
+        account_info = self._get_account_info_sync()
         if not account_info:
             return 0.01
-        
+
         balance = account_info['balance']
         risk_per_trade = self.config.risk_management.risk_per_trade
-        
+
         # Adjust risk based on signal confidence
-        confidence_multiplier = signal.confidence  # 0.15 to 1.0
+        confidence_multiplier = signal.confidence
         adjusted_risk = risk_per_trade * confidence_multiplier
-        
+
         # Adjust for volatility
         volatility = signal.metadata.get('volatility', 0.0001)
-        if volatility > 0.0002:  # High volatility
+        if volatility > 0.0002:
             adjusted_risk *= 0.7
-        elif volatility < 0.00005:  # Low volatility
+        elif volatility < 0.00005:
             adjusted_risk *= 1.2
-        
-        # Calculate position size
+
         risk_amount = balance * adjusted_risk
         stop_loss_pct = signal.metadata.get('stop_loss', 0.0002)
-        
-        # For forex: 1 lot = 100,000 units
-        # Risk per pip = lot_size * pip_value
-        pip_value = 10  # For standard lot on major pairs
-        stop_loss_pips = stop_loss_pct * 10000  # Convert to pips
-        
+
+        sym_info = mt5.symbol_info(symbol)
+        if sym_info is None:
+            logger.warning(f"Cannot get symbol info for {symbol}, using min lot")
+            return 0.01
+
+        # Use ask for BUY, bid for SELL as reference price
+        if signal.direction == SignalDirection.BUY:
+            ref_price = sym_info.ask
+        else:
+            ref_price = sym_info.bid
+
+        pip_value = sym_info.trade_contract_size * sym_info.point
+        stop_loss_pips = stop_loss_pct / sym_info.point if sym_info.point > 0 else stop_loss_pct * 10000
+
+        if pip_value <= 0 or stop_loss_pips <= 0:
+            return sym_info.volume_min
+
         lot_size = risk_amount / (stop_loss_pips * pip_value)
-        
-        # Clamp to reasonable range
-        lot_size = max(0.01, min(lot_size, 0.10))
-        
-        return round(lot_size, 2)
+
+        min_lot  = getattr(sym_info, 'volume_min', 0.01)
+        max_lot  = min(getattr(sym_info, 'volume_max', 100.0), 0.10)
+        lot_step = getattr(sym_info, 'volume_step', 0.01)
+
+        if lot_step > 0:
+            lot_size = round(round(lot_size / lot_step) * lot_step, 2)
+
+        return max(min_lot, min(lot_size, max_lot))
     
     def process_symbol(self, symbol: str, timeframe: str) -> None:
         """Process trading logic for a symbol."""
         try:
-            # Check if we should trade this symbol in current session
             if not self.session_manager.should_trade_symbol(symbol):
                 return
-            
-            # Get market data
-            market_data_raw = self.mt_connector.get_market_data(symbol, timeframe, bars=200)
-            
-            if not market_data_raw or len(market_data_raw) == 0:
+
+            market_data_raw = self._get_market_data_sync(symbol, timeframe, bars=200)
+            if not market_data_raw or len(market_data_raw) < MIN_BARS_WARMUP:
+                # Not enough bars for reliable indicator values
                 return
             
             latest_bar = market_data_raw[-1]
@@ -221,31 +327,41 @@ class EnhancedBot:
                     logger.info(f"⚠️  Max positions for {symbol} reached ({symbol_position_count}/{max_per_symbol})")
                     return
                 
+                # Circuit breaker
+                if self._consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD:
+                    logger.error(
+                        f"Circuit breaker: {self._consecutive_failures} consecutive failures. "
+                        "Pausing order placement."
+                    )
+                    return
+
                 # Calculate dynamic position size
                 volume = self.calculate_position_size(symbol, signal)
-                
-                # Get dynamic SL/TP from signal
-                current_price = float(latest_bar['close'])
-                stop_loss_pct = signal.metadata.get('stop_loss', 0.0002)
+
+                # Use ask/bid for SL/TP — not last bar close
+                sym_info = mt5.symbol_info(symbol)
+                if sym_info is None:
+                    logger.error(f"Cannot get symbol info for {symbol}")
+                    return
+
+                stop_loss_pct     = signal.metadata.get('stop_loss', 0.0002)
                 profit_target_pct = signal.metadata.get('profit_target', 0.0003)
-                
+                digits            = sym_info.digits
+
                 if signal.direction == SignalDirection.BUY:
-                    sl = current_price * (1 - stop_loss_pct)
-                    tp = current_price * (1 + profit_target_pct)
+                    ref_price  = sym_info.ask
+                    sl = round(ref_price * (1 - stop_loss_pct), digits)
+                    tp = round(ref_price * (1 + profit_target_pct), digits)
                     order_type = "BUY"
                 else:
-                    sl = current_price * (1 + stop_loss_pct)
-                    tp = current_price * (1 - profit_target_pct)
+                    ref_price  = sym_info.bid
+                    sl = round(ref_price * (1 + stop_loss_pct), digits)
+                    tp = round(ref_price * (1 - profit_target_pct), digits)
                     order_type = "SELL"
                 
                 # Place order
-                logger.info(f"🔵 PLACING {order_type} ORDER")
-                logger.info(f"   Symbol:        {symbol}")
-                logger.info(f"   Volume:        {volume} lots")
-                logger.info(f"   Entry Price:   {current_price:.5f}")
-                logger.info(f"   Stop Loss:     {sl:.5f}")
-                logger.info(f"   Take Profit:   {tp:.5f}")
-                
+                logger.info(f"[PLACING] {order_type} {symbol} {volume} lots | SL={sl:.{digits}f} TP={tp:.{digits}f}")
+
                 order_result = self.mt_connector.place_order(
                     symbol=symbol,
                     order_type=order_type,
@@ -254,24 +370,20 @@ class EnhancedBot:
                     tp=tp,
                     comment="Enhanced_HFT"
                 )
-                
+
                 if order_result:
+                    self._consecutive_failures = 0  # reset circuit breaker
                     self.trade_count += 1
-                    
-                    # Create unique position key
+
                     position_key = f"{symbol}_{int(datetime.now().timestamp())}"
-                    
-                    # Initialize counter if needed
+
                     if symbol not in self.position_counter:
                         self.position_counter[symbol] = 0
                     self.position_counter[symbol] += 1
-                    
-                    logger.info(f"✅ Trade #{self.trade_count} EXECUTED successfully")
-                    logger.info(f"   Position ID:   {position_key}")
-                    logger.info(f"   Order ID:      {order_result['order_id']}")
-                    logger.info(f"   {symbol} Positions: {self.position_counter[symbol]}/{max_per_symbol}")
+
+                    logger.info(f"[OK] Trade #{self.trade_count} executed | ticket={order_result['order_id']} fill={order_result['price']:.{digits}f}")
                     logger.info("=" * 70)
-                    
+
                     self.open_positions[position_key] = {
                         'symbol': symbol,
                         'order_id': order_result['order_id'],
@@ -284,52 +396,46 @@ class EnhancedBot:
                         'confidence': signal.confidence
                     }
                 else:
-                    logger.error(f"❌ Failed to place order for {symbol}")
+                    self._consecutive_failures += 1
+                    logger.error(f"[FAIL] Order failed for {symbol} (failure #{self._consecutive_failures})")
                     logger.info("=" * 70)
             
         except Exception as e:
             logger.error(f"Error processing {symbol}: {e}", exc_info=True)
     
     def _calculate_indicators(self, closes: list, highs: list, lows: list) -> Dict[str, float]:
-        """Calculate comprehensive technical indicators."""
+        """Calculate comprehensive technical indicators using shared module."""
         if len(closes) < 50:
             return {}
         
         try:
-            prices = np.array(closes)
-            
             # Moving Averages
-            sma_20 = np.mean(prices[-20:])
-            sma_50 = np.mean(prices[-50:])
-            ema_12 = self._calculate_ema(prices, 12)
-            ema_26 = self._calculate_ema(prices, 26)
+            sma_20 = float(np.mean(closes[-20:]))
+            sma_50 = float(np.mean(closes[-50:]))
+            ema_12 = calculate_ema(closes, 12)
+            ema_26 = calculate_ema(closes, 26)
             
-            # MACD
-            macd_line = ema_12 - ema_26
-            macd_signal_line = self._calculate_ema(np.array([macd_line] * 9), 9)
-            macd_histogram = macd_line - macd_signal_line
+            # MACD (true signal EMA — Bug 4 fixed via shared module)
+            macd_line, macd_signal_line, macd_histogram = calculate_macd(closes)
             
             # RSI
-            rsi = self._calculate_rsi(closes)
+            rsi = calculate_rsi(closes)
             
             # Bollinger Bands
-            bb_middle = sma_20
-            bb_std = np.std(prices[-20:])
-            bb_upper = bb_middle + (2 * bb_std)
-            bb_lower = bb_middle - (2 * bb_std)
+            bb_upper, bb_middle, bb_lower = calculate_bollinger_bands(closes)
             bb_width = (bb_upper - bb_lower) / bb_middle if bb_middle > 0 else 0
             
             # Stochastic Oscillator
-            stoch_k, stoch_d = self._calculate_stochastic(closes, highs, lows)
+            stoch_k, stoch_d = calculate_stochastic(closes, highs, lows)
             
-            # ADX (Average Directional Index)
-            adx = self._calculate_adx(closes, highs, lows)
+            # ADX (Wilder-smoothed — Bug 3 fixed via shared module)
+            adx = calculate_adx(closes, highs, lows)
             
-            # ATR (Average True Range)
-            atr = self._calculate_atr(closes, highs, lows)
+            # ATR
+            atr = calculate_atr(closes, highs, lows)
             
-            # CCI (Commodity Channel Index)
-            cci = self._calculate_cci(closes, highs, lows)
+            # CCI
+            cci = calculate_cci(closes, highs, lows)
             
             return {
                 'sma_20': sma_20,
@@ -353,166 +459,6 @@ class EnhancedBot:
         except Exception as e:
             logger.error(f"Error calculating indicators: {e}")
             return {}
-    
-    def _calculate_ema(self, prices: np.ndarray, period: int) -> float:
-        """Calculate Exponential Moving Average."""
-        if len(prices) < period:
-            return prices[-1]
-        
-        multiplier = 2 / (period + 1)
-        ema = prices[-period]
-        
-        for price in prices[-period+1:]:
-            ema = (price * multiplier) + (ema * (1 - multiplier))
-        
-        return ema
-    
-    def _calculate_stochastic(self, closes: list, highs: list, lows: list, period: int = 14) -> tuple:
-        """Calculate Stochastic Oscillator."""
-        try:
-            if len(closes) < period or len(highs) < period or len(lows) < period:
-                return 50.0, 50.0
-            
-            recent_closes = closes[-period:]
-            recent_highs = highs[-period:]
-            recent_lows = lows[-period:]
-            
-            highest_high = max(recent_highs)
-            lowest_low = min(recent_lows)
-            
-            if highest_high == lowest_low:
-                return 50.0, 50.0
-            
-            stoch_k = ((recent_closes[-1] - lowest_low) / (highest_high - lowest_low)) * 100
-            stoch_d = stoch_k  # Simplified
-            
-            return stoch_k, stoch_d
-        except:
-            return 50.0, 50.0
-    
-    def _calculate_adx(self, closes: list, highs: list, lows: list, period: int = 14) -> float:
-        """Calculate Average Directional Index."""
-        try:
-            if len(closes) < period + 1:
-                return 25.0
-            
-            # Simplified ADX calculation
-            tr_list = []
-            for i in range(1, len(closes)):
-                high_low = highs[i] - lows[i]
-                high_close = abs(highs[i] - closes[i-1])
-                low_close = abs(lows[i] - closes[i-1])
-                tr = max(high_low, high_close, low_close)
-                tr_list.append(tr)
-            
-            if len(tr_list) < period:
-                return 25.0
-            
-            atr = np.mean(tr_list[-period:])
-            
-            # Calculate directional movement
-            plus_dm = []
-            minus_dm = []
-            
-            for i in range(1, len(highs)):
-                high_diff = highs[i] - highs[i-1]
-                low_diff = lows[i-1] - lows[i]
-                
-                if high_diff > low_diff and high_diff > 0:
-                    plus_dm.append(high_diff)
-                    minus_dm.append(0)
-                elif low_diff > high_diff and low_diff > 0:
-                    plus_dm.append(0)
-                    minus_dm.append(low_diff)
-                else:
-                    plus_dm.append(0)
-                    minus_dm.append(0)
-            
-            if len(plus_dm) < period or atr == 0:
-                return 25.0
-            
-            plus_di = (np.mean(plus_dm[-period:]) / atr) * 100
-            minus_di = (np.mean(minus_dm[-period:]) / atr) * 100
-            
-            if plus_di + minus_di == 0:
-                return 25.0
-            
-            dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-            return dx
-        except:
-            return 25.0
-    
-    def _calculate_atr(self, closes: list, highs: list, lows: list, period: int = 14) -> float:
-        """Calculate Average True Range."""
-        try:
-            if len(closes) < period + 1:
-                return 0.0001
-            
-            tr_list = []
-            for i in range(1, len(closes)):
-                high_low = highs[i] - lows[i]
-                high_close = abs(highs[i] - closes[i-1])
-                low_close = abs(lows[i] - closes[i-1])
-                tr = max(high_low, high_close, low_close)
-                tr_list.append(tr)
-            
-            if len(tr_list) < period:
-                return 0.0001
-            
-            return np.mean(tr_list[-period:])
-        except:
-            return 0.0001
-    
-    def _calculate_cci(self, closes: list, highs: list, lows: list, period: int = 20) -> float:
-        """Calculate Commodity Channel Index."""
-        try:
-            if len(closes) < period or len(highs) < period or len(lows) < period:
-                return 0.0
-            
-            typical_prices = [(highs[i] + lows[i] + closes[i]) / 3 for i in range(len(closes))]
-            
-            if len(typical_prices) < period:
-                return 0.0
-            
-            sma_tp = np.mean(typical_prices[-period:])
-            deviations = [abs(tp - sma_tp) for tp in typical_prices[-period:]]
-            mean_deviation = np.mean(deviations)
-            
-            if mean_deviation == 0:
-                return 0.0
-            
-            cci = (typical_prices[-1] - sma_tp) / (0.015 * mean_deviation)
-            return cci
-        except:
-            return 0.0
-    
-    def _calculate_rsi(self, prices: list, period: int = 14) -> float:
-        """Calculate RSI."""
-        if len(prices) < period + 1:
-            return 50.0
-        
-        gains = []
-        losses = []
-        
-        for i in range(len(prices) - period, len(prices)):
-            change = prices[i] - prices[i-1]
-            if change > 0:
-                gains.append(change)
-                losses.append(0)
-            else:
-                gains.append(0)
-                losses.append(abs(change))
-        
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
-        
-        if avg_loss == 0:
-            return 100.0
-        
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        
-        return rsi
     
     def monitor_positions(self) -> None:
         """Monitor and update open positions."""
@@ -542,13 +488,20 @@ class EnhancedBot:
                 if symbol in self.position_counter:
                     self.position_counter[symbol] = max(0, self.position_counter[symbol] - 1)
                 
-                # Track win/loss (simplified)
-                if pos_info.get('confidence', 0) > 0.5:
-                    self.win_count += 1
-                    logger.info(f"   ✅ Likely WIN (confidence: {pos_info['confidence']:.2%})")
+                # Track win/loss based on actual MT5 P&L (Bug 2 fix)
+                order_id = pos_info['order_id']
+                from_date = pos_info['timestamp'] - timedelta(seconds=1)
+                deals = mt5.history_deals_get(from_date, datetime.now(), group=symbol)
+                if deals:
+                    pnl = sum(d.profit for d in deals if d.position_id == order_id)
+                    if pnl > 0:
+                        self.win_count += 1
+                        logger.info(f"   ✅ WIN (P&L: {pnl:.2f})")
+                    else:
+                        self.loss_count += 1
+                        logger.info(f"   ❌ LOSS (P&L: {pnl:.2f})")
                 else:
-                    self.loss_count += 1
-                    logger.info(f"   ❌ Likely LOSS (confidence: {pos_info['confidence']:.2%})")
+                    logger.warning(f"No deal history for {pos_key}, excluding from stats")
                 
                 del self.open_positions[pos_key]
             
@@ -558,7 +511,7 @@ class EnhancedBot:
     def log_status(self) -> None:
         """Log current bot status."""
         try:
-            account_info = self.mt_connector.get_account_info()
+            account_info = self._get_account_info_sync()
             session_config = self.session_manager.get_session_config()
             
             if account_info:
@@ -597,80 +550,119 @@ class EnhancedBot:
             logger.info("=" * 60)
             logger.info("ENHANCED HFT TRADING BOT")
             logger.info("=" * 60)
-            logger.info("Features:")
-            logger.info("  • Multi-layer signal analysis")
-            logger.info("  • Dynamic position sizing")
-            logger.info("  • Trend + Momentum + Volume + Volatility")
-            logger.info("  • Support/Resistance detection")
-            logger.info("  • Adaptive risk management")
-            logger.info("=" * 60)
-            
+
             # Connect to MetaTrader
             if not self.mt_connector.connect():
                 logger.error("Failed to connect to MetaTrader")
                 return
-            
+
             logger.info("[OK] Connected to MetaTrader 5")
-            
-            # Get account info
-            account_info = self.mt_connector.get_account_info()
+
+            account_info = self._get_account_info_sync()
             if account_info:
                 logger.info(f"Account: {account_info['login']}")
                 logger.info(f"Balance: {account_info['balance']} USD")
-            
+
+            # Sync any existing open positions before starting the loop
+            self._sync_positions_from_broker()
+
             logger.info("=" * 60)
-            logger.info("[START] Enhanced Bot Started")
-            logger.info("Press Ctrl+C to stop")
+            logger.info("[START] Enhanced Bot Started — Press Ctrl+C to stop")
             logger.info("=" * 60)
-            
+
             self.running = True
             last_status_time = datetime.now()
-            
-            # Main trading loop
+
             while self.running:
+                # Connection health check
+                if not self._is_connected():
+                    logger.warning("MT5 connection lost")
+                    if not self._reconnect():
+                        break
+
                 try:
-                    # Update session
                     self.session_manager.update_session()
-                    
-                    # Process each symbol
+
                     for symbol in self.config.trading.symbols:
                         for timeframe in self.config.trading.timeframes:
+                            if not self.running:
+                                break
                             self.process_symbol(symbol, timeframe)
-                    
-                    # Monitor positions
+
                     self.monitor_positions()
-                    
-                    # Log status every 60 seconds
+
                     if (datetime.now() - last_status_time).total_seconds() >= 60:
                         self.log_status()
                         last_status_time = datetime.now()
-                    
-                    # Sleep
+
                     time.sleep(3)
-                    
+
                 except KeyboardInterrupt:
                     logger.info("\n[WARNING] Keyboard interrupt received")
                     break
                 except Exception as e:
                     logger.error(f"Error in main loop: {e}", exc_info=True)
                     time.sleep(5)
-            
+
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
         finally:
             self.stop()
+
+    def _is_connected(self) -> bool:
+        """Quick connection health check."""
+        try:
+            return self._get_account_info_sync() is not None
+        except Exception:
+            return False
+
+    def _reconnect(self) -> bool:
+        """Attempt to reconnect to MT5 with backoff."""
+        for attempt in range(1, MAX_RECONNECT_ATTEMPTS + 1):
+            logger.warning(f"Reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS}...")
+            self.mt_connector.disconnect()
+            time.sleep(RECONNECT_DELAY)
+            if self.mt_connector.connect():
+                logger.info("[OK] Reconnected to MT5")
+                self._sync_positions_from_broker()
+                return True
+        logger.error("All reconnect attempts failed — stopping bot")
+        return False
     
     def stop(self) -> None:
-        """Stop the trading bot."""
+        """Stop the trading bot — close all open positions first."""
         logger.info("=" * 60)
-        logger.info("Stopping Enhanced Bot...")
+        logger.info("Stopping Enhanced Bot — closing all positions...")
         logger.info("=" * 60)
-        
         self.running = False
+
+        self._close_all_positions()
         self.log_status()
         self.mt_connector.disconnect()
-        
-        logger.info("[OK] Bot stopped successfully")
+        logger.info("[OK] Bot stopped")
+
+    def _close_all_positions(self) -> None:
+        """Close every open position via MT5."""
+        try:
+            mt_positions = self.mt_connector.get_positions()
+            if not mt_positions:
+                logger.info("No open positions to close")
+                return
+
+            closed = 0
+            for pos in mt_positions:
+                ticket = pos['ticket']
+                if self.mt_connector.close_position(ticket):
+                    closed += 1
+                    logger.info(f"[CLOSED] ticket={ticket} {pos['symbol']}")
+                else:
+                    logger.error(f"[FAIL] Could not close ticket={ticket}")
+
+            self.open_positions.clear()
+            self.position_counter.clear()
+            logger.info(f"Closed {closed}/{len(mt_positions)} positions")
+        except Exception as e:
+            logger.error(f"Error in _close_all_positions: {e}")
     
     def signal_handler(self, signum, frame):
         """Handle shutdown signals."""

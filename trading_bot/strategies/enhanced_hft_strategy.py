@@ -6,9 +6,15 @@ from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 from decimal import Decimal
 import numpy as np
+from collections import deque
 
 from ..models.core import MarketData, TradingSignal
 from ..models.enums import SignalDirection
+from ..utils.indicators import (
+    calculate_ema, calculate_rsi, calculate_macd,
+    calculate_adx, calculate_atr, calculate_stochastic,
+    calculate_cci,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,25 +34,27 @@ class EnhancedHFTStrategy:
         
         # Enhanced parameters
         self.tick_threshold = self.parameters.get('tick_threshold', 0.000003)
-        self.volume_multiplier = self.parameters.get('volume_multiplier', 1.05)
+        self.volume_multiplier = self.parameters.get('volume_multiplier', 1.5)
         self.spread_threshold = self.parameters.get('spread_threshold', 0.00002)
-        self.min_confidence = self.parameters.get('min_confidence', 0.15)
-        self.profit_target = self.parameters.get('profit_target', 0.0003)
-        self.stop_loss = self.parameters.get('stop_loss', 0.0002)
-        self.max_hold_time = self.parameters.get('max_hold_time', 300)
-        
+        self.min_confidence = self.parameters.get('min_confidence', 0.65)   # raised: require strong agreement
+        self.profit_target = self.parameters.get('profit_target', 0.0008)   # ~$3.2 on XAUUSD @4000
+        self.stop_loss = self.parameters.get('stop_loss', 0.0005)           # ~$2 on XAUUSD @4000
+        self.max_hold_time = self.parameters.get('max_hold_time', 600)
+
         # Advanced parameters
         self.trend_strength_threshold = self.parameters.get('trend_strength_threshold', 0.6)
         self.momentum_periods = self.parameters.get('momentum_periods', [5, 10, 20])
         self.volatility_window = self.parameters.get('volatility_window', 20)
         self.min_risk_reward = self.parameters.get('min_risk_reward', 1.5)
+        self.signal_cooldown_seconds = self.parameters.get('signal_cooldown_seconds', 60)  # 1 min between signals
+        self.min_signals_required = self.parameters.get('min_signals_required', 3)         # need 3/5 layers to agree
         
         # State tracking
         self._state = {
             'symbol': None,
-            'tick_history': [],
-            'price_history': [],
-            'volume_history': [],
+            'tick_history': deque(maxlen=200),
+            'price_history': deque(maxlen=200),
+            'volume_history': deque(maxlen=200),
             'signal_count': 0,
             'last_signal_time': None,
             'avg_volume': 0,
@@ -84,7 +92,7 @@ class EnhancedHFTStrategy:
             # Signal cooldown
             if self._state['last_signal_time']:
                 time_since_last = market_data.timestamp - self._state['last_signal_time']
-                if time_since_last < timedelta(seconds=2):
+                if time_since_last < timedelta(seconds=self.signal_cooldown_seconds):
                     return None
             
             # Multi-layer analysis
@@ -93,21 +101,34 @@ class EnhancedHFTStrategy:
             volume_signal = self._analyze_volume(current_volume)
             volatility_signal = self._analyze_volatility(current_price)
             support_resistance_signal = self._analyze_support_resistance(current_price)
-            
+
+            # --- Indicator conflict check using market_data indicators ---
+            indicators = market_data.indicators or {}
+            if not self._indicators_agree(indicators):
+                return None
+
             # Combine signals with weighted scoring
             signals = [
-                (trend_signal, 0.30),           # 30% weight
-                (momentum_signal, 0.25),        # 25% weight
-                (volume_signal, 0.20),          # 20% weight
-                (volatility_signal, 0.15),      # 15% weight
-                (support_resistance_signal, 0.10)  # 10% weight
+                (trend_signal, 0.30),
+                (momentum_signal, 0.25),
+                (volume_signal, 0.20),
+                (volatility_signal, 0.15),
+                (support_resistance_signal, 0.10)
             ]
-            
+
+            # Count how many layers fired and in which direction
+            buy_count = sum(1 for s, _ in signals if s and s.direction == SignalDirection.BUY)
+            sell_count = sum(1 for s, _ in signals if s and s.direction == SignalDirection.SELL)
+
+            # Require minimum number of agreeing signals
+            if buy_count < self.min_signals_required and sell_count < self.min_signals_required:
+                return None
+
             # Calculate weighted score
             buy_score = 0
             sell_score = 0
             total_weight = 0
-            
+
             for signal, weight in signals:
                 if signal:
                     total_weight += weight
@@ -115,15 +136,13 @@ class EnhancedHFTStrategy:
                         buy_score += signal.confidence * weight
                     else:
                         sell_score += signal.confidence * weight
-            
-            # Determine final signal
+
             if total_weight == 0:
                 return None
-            
-            # Normalize scores
+
             buy_score = buy_score / total_weight if total_weight > 0 else 0
             sell_score = sell_score / total_weight if total_weight > 0 else 0
-            
+
             # Choose direction with higher score
             if buy_score > sell_score and buy_score >= self.min_confidence:
                 direction = SignalDirection.BUY
@@ -192,28 +211,19 @@ class EnhancedHFTStrategy:
             'volume': volume,
             'timestamp': market_data.timestamp
         })
-        
+
         self._state['price_history'].append(price)
         self._state['volume_history'].append(volume)
-        
-        # Keep only recent data
-        max_history = 200
-        if len(self._state['tick_history']) > max_history:
-            self._state['tick_history'] = self._state['tick_history'][-max_history:]
-        if len(self._state['price_history']) > max_history:
-            self._state['price_history'] = self._state['price_history'][-max_history:]
-        if len(self._state['volume_history']) > max_history:
-            self._state['volume_history'] = self._state['volume_history'][-max_history:]
-        
+
         # Calculate average volume
         if len(self._state['volume_history']) >= 20:
-            self._state['avg_volume'] = np.mean(self._state['volume_history'][-20:])
-        
+            self._state['avg_volume'] = np.mean(list(self._state['volume_history'])[-20:])
+
         # Calculate volatility (ATR-like)
         if len(self._state['price_history']) >= self.volatility_window:
-            prices = np.array(self._state['price_history'][-self.volatility_window:])
+            prices = np.array(self._state['price_history'])
             self._state['volatility'] = np.std(prices)
-        
+
         # Update support/resistance levels
         self._update_support_resistance()
     
@@ -226,9 +236,9 @@ class EnhancedHFTStrategy:
             prices = np.array(self._state['price_history'])
             
             # Calculate EMAs
-            ema_fast = self._calculate_ema(prices, 10)
-            ema_medium = self._calculate_ema(prices, 20)
-            ema_slow = self._calculate_ema(prices, 50)
+            ema_fast = calculate_ema(prices, 10)
+            ema_medium = calculate_ema(prices, 20)
+            ema_slow = calculate_ema(prices, 50)
             
             # Trend direction
             if ema_fast > ema_medium > ema_slow:
@@ -335,7 +345,7 @@ class EnhancedHFTStrategy:
             
             # Volume spike with price movement
             if volume_ratio >= self.volume_multiplier:
-                recent_prices = self._state['price_history'][-5:]
+                recent_prices = list(self._state['price_history'])[-5:]
                 price_change = (recent_prices[-1] - recent_prices[0]) / recent_prices[0]
                 
                 if price_change > 0.00003:  # 0.3 pips
@@ -370,13 +380,16 @@ class EnhancedHFTStrategy:
             if self._state['volatility'] == 0:
                 return None
             
+            # Convert deque to list before slicing
+            price_list = list(self._state['price_history'])
+
             # Check for volatility expansion
-            recent_volatility = np.std(self._state['price_history'][-10:])
+            recent_volatility = np.std(price_list[-10:])
             volatility_ratio = recent_volatility / self._state['volatility']
             
             if volatility_ratio > 1.3:  # 30% increase in volatility
                 # Determine direction from recent price action
-                recent_change = (self._state['price_history'][-1] - self._state['price_history'][-5]) / self._state['price_history'][-5]
+                recent_change = (price_list[-1] - price_list[-5]) / price_list[-5]
                 
                 if recent_change > 0:
                     direction = SignalDirection.BUY
@@ -452,7 +465,8 @@ class EnhancedHFTStrategy:
             if len(self._state['price_history']) < 50:
                 return
             
-            prices = np.array(self._state['price_history'][-50:])
+            # Convert deque to numpy array before slicing
+            prices = np.array(list(self._state['price_history'])[-50:])
             
             # Find local minima (support)
             supports = []
@@ -474,167 +488,71 @@ class EnhancedHFTStrategy:
         except Exception as e:
             logger.error(f"Error updating support/resistance: {e}")
     
-    def _calculate_ema(self, prices: np.ndarray, period: int) -> float:
-        """Calculate Exponential Moving Average."""
-        if len(prices) < period:
-            return prices[-1]
-        
-        multiplier = 2 / (period + 1)
-        ema = prices[-period]
-        
-        for price in prices[-period+1:]:
-            ema = (price * multiplier) + (ema * (1 - multiplier))
-        
-        return ema
-    
+    def _indicators_agree(self, indicators: dict) -> bool:
+        """
+        Check that key indicators don't contradict each other.
+        Requires at least 70% of indicator votes to agree on one direction.
+        """
+        if not indicators:
+            return False
+
+        votes_buy = 0
+        votes_sell = 0
+
+        # RSI
+        rsi = indicators.get('rsi')
+        if rsi is not None:
+            if rsi < 45:
+                votes_sell += 1
+            elif rsi > 55:
+                votes_buy += 1
+
+        # MACD value
+        macd = indicators.get('macd')
+        if macd is not None:
+            if macd < 0:
+                votes_sell += 1
+            elif macd > 0:
+                votes_buy += 1
+
+        # MACD crossover
+        macd_signal = indicators.get('macd_signal')
+        if macd is not None and macd_signal is not None:
+            if macd > macd_signal:
+                votes_buy += 1
+            elif macd < macd_signal:
+                votes_sell += 1
+
+        # Stochastic crossover from extremes only
+        stoch_k = indicators.get('stoch_k')
+        stoch_d = indicators.get('stoch_d')
+        if stoch_k is not None and stoch_d is not None:
+            if stoch_k < 25 and stoch_k > stoch_d:
+                votes_buy += 1
+            elif stoch_k > 75 and stoch_k < stoch_d:
+                votes_sell += 1
+
+        # EMA crossover
+        ema_12 = indicators.get('ema_12')
+        ema_26 = indicators.get('ema_26')
+        if ema_12 is not None and ema_26 is not None:
+            if ema_12 > ema_26:
+                votes_buy += 1
+            elif ema_12 < ema_26:
+                votes_sell += 1
+
+        total_votes = votes_buy + votes_sell
+        if total_votes < 3:
+            return False
+
+        buy_ratio = votes_buy / total_votes
+        sell_ratio = votes_sell / total_votes
+        return buy_ratio >= 0.70 or sell_ratio >= 0.70
+
     def get_name(self) -> str:
         """Get strategy name."""
         return "EnhancedHFTStrategy"
 
-    
-    def _calculate_stochastic(self, closes: list, highs: list, lows: list, period: int = 14) -> tuple:
-        """Calculate Stochastic Oscillator (%K and %D)."""
-        try:
-            if len(closes) < period or len(highs) < period or len(lows) < period:
-                return 50.0, 50.0
-            
-            # Get recent data
-            recent_closes = closes[-period:]
-            recent_highs = highs[-period:]
-            recent_lows = lows[-period:]
-            
-            # Calculate %K
-            highest_high = max(recent_highs)
-            lowest_low = min(recent_lows)
-            
-            if highest_high == lowest_low:
-                stoch_k = 50.0
-            else:
-                stoch_k = ((recent_closes[-1] - lowest_low) / (highest_high - lowest_low)) * 100
-            
-            # Calculate %D (3-period SMA of %K)
-            # For simplicity, using current %K as %D
-            stoch_d = stoch_k
-            
-            return stoch_k, stoch_d
-            
-        except Exception as e:
-            logger.error(f"Error calculating Stochastic: {e}")
-            return 50.0, 50.0
-    
-    def _calculate_adx(self, closes: list, highs: list, lows: list, period: int = 14) -> float:
-        """Calculate Average Directional Index (ADX)."""
-        try:
-            if len(closes) < period + 1 or len(highs) < period + 1 or len(lows) < period + 1:
-                return 25.0
-            
-            # Calculate True Range
-            tr_list = []
-            for i in range(1, len(closes)):
-                high_low = highs[i] - lows[i]
-                high_close = abs(highs[i] - closes[i-1])
-                low_close = abs(lows[i] - closes[i-1])
-                tr = max(high_low, high_close, low_close)
-                tr_list.append(tr)
-            
-            if len(tr_list) < period:
-                return 25.0
-            
-            # Calculate +DM and -DM
-            plus_dm = []
-            minus_dm = []
-            
-            for i in range(1, len(highs)):
-                high_diff = highs[i] - highs[i-1]
-                low_diff = lows[i-1] - lows[i]
-                
-                if high_diff > low_diff and high_diff > 0:
-                    plus_dm.append(high_diff)
-                    minus_dm.append(0)
-                elif low_diff > high_diff and low_diff > 0:
-                    plus_dm.append(0)
-                    minus_dm.append(low_diff)
-                else:
-                    plus_dm.append(0)
-                    minus_dm.append(0)
-            
-            # Calculate smoothed values
-            atr = np.mean(tr_list[-period:])
-            plus_di = (np.mean(plus_dm[-period:]) / atr) * 100 if atr > 0 else 0
-            minus_di = (np.mean(minus_dm[-period:]) / atr) * 100 if atr > 0 else 0
-            
-            # Calculate DX and ADX
-            if plus_di + minus_di == 0:
-                return 25.0
-            
-            dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
-            adx = dx  # Simplified ADX
-            
-            return adx
-            
-        except Exception as e:
-            logger.error(f"Error calculating ADX: {e}")
-            return 25.0
-    
-    def _calculate_atr(self, closes: list, highs: list, lows: list, period: int = 14) -> float:
-        """Calculate Average True Range (ATR)."""
-        try:
-            if len(closes) < period + 1 or len(highs) < period + 1 or len(lows) < period + 1:
-                return np.std(closes[-period:]) if len(closes) >= period else 0.0001
-            
-            tr_list = []
-            for i in range(1, len(closes)):
-                high_low = highs[i] - lows[i]
-                high_close = abs(highs[i] - closes[i-1])
-                low_close = abs(lows[i] - closes[i-1])
-                tr = max(high_low, high_close, low_close)
-                tr_list.append(tr)
-            
-            if len(tr_list) < period:
-                return 0.0001
-            
-            atr = np.mean(tr_list[-period:])
-            return atr
-            
-        except Exception as e:
-            logger.error(f"Error calculating ATR: {e}")
-            return 0.0001
-    
-    def _calculate_cci(self, closes: list, highs: list, lows: list, period: int = 20) -> float:
-        """Calculate Commodity Channel Index (CCI)."""
-        try:
-            if not highs or not lows or len(closes) < period or len(highs) < period or len(lows) < period:
-                return 0.0
-            
-            # Calculate Typical Price
-            typical_prices = []
-            for i in range(len(closes)):
-                if i < len(highs) and i < len(lows):
-                    tp = (highs[i] + lows[i] + closes[i]) / 3
-                    typical_prices.append(tp)
-            
-            if len(typical_prices) < period:
-                return 0.0
-            
-            # Calculate SMA of Typical Price
-            sma_tp = np.mean(typical_prices[-period:])
-            
-            # Calculate Mean Deviation
-            deviations = [abs(tp - sma_tp) for tp in typical_prices[-period:]]
-            mean_deviation = np.mean(deviations)
-            
-            if mean_deviation == 0:
-                return 0.0
-            
-            # Calculate CCI
-            cci = (typical_prices[-1] - sma_tp) / (0.015 * mean_deviation)
-            
-            return cci
-            
-        except Exception as e:
-            logger.error(f"Error calculating CCI: {e}")
-            return 0.0
-    
     def _analyze_indicators(self, market_data: MarketData) -> Optional[TradingSignal]:
         """Analyze using multiple technical indicators."""
         try:
@@ -661,10 +579,7 @@ class EnhancedHFTStrategy:
                 signals.append(('BUY', 0.8, 'RSI_Oversold'))
             elif rsi > 70:
                 signals.append(('SELL', 0.8, 'RSI_Overbought'))
-            elif rsi < 40:
-                signals.append(('BUY', 0.5, 'RSI_Weak'))
-            elif rsi > 60:
-                signals.append(('SELL', 0.5, 'RSI_Strong'))
+            # Removed weak RSI signals (40-60) — they generate noise
             
             # Bollinger Bands Signal
             bb_upper = indicators.get('bb_upper', 0)
@@ -676,10 +591,7 @@ class EnhancedHFTStrategy:
                     signals.append(('BUY', 0.75, 'BB_Lower'))
                 elif current_price >= bb_upper:
                     signals.append(('SELL', 0.75, 'BB_Upper'))
-                elif current_price < bb_middle:
-                    signals.append(('BUY', 0.4, 'BB_Below_Mid'))
-                elif current_price > bb_middle:
-                    signals.append(('SELL', 0.4, 'BB_Above_Mid'))
+                # Removed middle-band signals — too noisy
             
             # Stochastic Signal
             stoch_k = indicators.get('stoch_k', 50)
@@ -718,11 +630,11 @@ class EnhancedHFTStrategy:
             buy_score = sum(conf for conf, _ in buy_signals) / len(signals) if buy_signals else 0
             sell_score = sum(conf for conf, _ in sell_signals) / len(signals) if sell_signals else 0
             
-            if buy_score > sell_score and buy_score >= 0.4:
+            if buy_score > sell_score and buy_score >= 0.60:
                 direction = SignalDirection.BUY
                 confidence = min(buy_score, 1.0)
                 sources = [src for _, src in buy_signals]
-            elif sell_score > buy_score and sell_score >= 0.4:
+            elif sell_score > buy_score and sell_score >= 0.60:
                 direction = SignalDirection.SELL
                 confidence = min(sell_score, 1.0)
                 sources = [src for _, src in sell_signals]
