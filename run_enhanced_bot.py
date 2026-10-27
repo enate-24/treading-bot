@@ -33,14 +33,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _safe_float(value, default=None):
+    """Coerce broker-supplied numbers to float, falling back on bad values."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 # Import bot components
 from trading_bot.connectors.metatrader_connector import MetaTraderConnector
 from trading_bot.signal_generator import SignalGenerator
 from trading_bot.strategies.enhanced_hft_strategy import EnhancedHFTStrategy
 from trading_bot.session_manager import SessionManager
 from trading_bot.performance_monitor import PerformanceMonitor
-from trading_bot.models.core import MarketData, OHLCV, TradingSignal, ExecutedTrade
-from trading_bot.models.enums import SignalDirection, OrderSide
+from trading_bot.risk_manager import RiskManager
+from trading_bot.portfolio_adapter import MetaTraderPortfolioAdapter
+from trading_bot.models.core import (
+    MarketData, OHLCV, TradingSignal, ExecutedTrade, OrderRequest,
+)
+from trading_bot.models.enums import SignalDirection, OrderSide, OrderType, TimeInForce
 from trading_bot.utils.indicators import (
     calculate_ema, calculate_rsi, calculate_macd,
     calculate_adx, calculate_atr, calculate_stochastic,
@@ -86,13 +98,35 @@ class EnhancedBot:
             server=mt5_server,
             mt_version=config_dict['metatrader'].get('version', 5)
         )
-        self.enhanced_strategy = EnhancedHFTStrategy(
-            config_dict.get('strategy_parameters', {}).get('enhanced_hft', {})
-        )
-        self.signal_generator = SignalGenerator()
-        self.signal_generator.set_strategy(self.enhanced_strategy)
+        self.strategy_params = config_dict.get('strategy_parameters', {}).get('enhanced_hft', {})
+        # One strategy + signal generator per (symbol, timeframe). Sharing a
+        # single instance lets indicator/state buffers from EURUSD, JPY pairs
+        # and XAUUSD contaminate each other and corrupt every signal.
+        self.signal_generators: Dict[tuple, SignalGenerator] = {}
         self.session_manager = SessionManager(config_dict)
-        self.performance_monitor = PerformanceMonitor(self.config)
+        self.performance_monitor = PerformanceMonitor(risk_free_rate=0.02)
+
+        # Live risk controls: portfolio state comes from the broker so daily
+        # loss, drawdown, correlation and emergency-stop checks use real
+        # account figures.  close_position_fn lets the manager flatten a
+        # position when its stop/take-profit is breached programmatically.
+        risk_cfg = config_dict.get('risk_management', {})
+        trading_cfg = config_dict.get('trading', {})
+        self.portfolio = MetaTraderPortfolioAdapter(self.mt_connector)
+        self.risk_manager = RiskManager(
+            self.portfolio,
+            {
+                'max_risk_per_trade': risk_cfg.get('risk_per_trade', 0.01),
+                'max_portfolio_drawdown': risk_cfg.get(
+                    'max_portfolio_drawdown', trading_cfg.get('max_drawdown', 0.10)
+                ),
+                'daily_loss_limit': risk_cfg.get('daily_loss_limit', 0.05),
+                'max_position_correlation': risk_cfg.get('max_position_correlation', 0.5),
+                'emergency_stop_drawdown': risk_cfg.get('emergency_stop_drawdown', 0.15),
+                'leverage': risk_cfg.get('leverage', 1),
+            },
+            close_position_fn=self.mt_connector.close_position,
+        )
         
         # Trading state
         self.running = False
@@ -151,11 +185,18 @@ class EnhancedBot:
         except Exception as e:
             logger.error(f"Error syncing positions: {e}")
     
-    def _run_async(self, coro):
-        """Run an async coroutine from synchronous code."""
+    def _run_async(self, result):
+        """Run an async coroutine from synchronous code.
+
+        Non-coroutine values are returned unchanged so callers (and tests)
+        that provide an already-resolved value keep working.
+        """
+        if not asyncio.iscoroutine(result):
+            return result
+        coro = result
         try:
             try:
-                loop = asyncio.get_running_loop()
+                asyncio.get_running_loop()
                 # Already inside a running loop — run in a thread
                 import concurrent.futures
                 with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -206,27 +247,46 @@ class EnhancedBot:
 
         # Use ask for BUY, bid for SELL as reference price
         if signal.direction == SignalDirection.BUY:
-            ref_price = sym_info.ask
+            ref_price = _safe_float(getattr(sym_info, 'ask', None))
         else:
-            ref_price = sym_info.bid
+            ref_price = _safe_float(getattr(sym_info, 'bid', None))
 
-        pip_value = sym_info.trade_contract_size * sym_info.point
-        stop_loss_pips = stop_loss_pct / sym_info.point if sym_info.point > 0 else stop_loss_pct * 10000
+        point = _safe_float(getattr(sym_info, 'point', 0.0), 0.0)
+        contract = _safe_float(getattr(sym_info, 'trade_contract_size', 0.0), 0.0)
 
-        if pip_value <= 0 or stop_loss_pips <= 0:
-            return sym_info.volume_min
+        # Risk is measured in price units: loss per lot = stop distance * contract.
+        # This keeps sizing correct across FX, JPY pairs and metals, where a
+        # fixed pip/point value would be wrong by orders of magnitude.
+        if ref_price and ref_price > 0:
+            stop_distance = ref_price * stop_loss_pct
+        else:
+            stop_distance = stop_loss_pct  # price unavailable; assume unit price
 
-        lot_size = risk_amount / (stop_loss_pips * pip_value)
+        min_lot  = _safe_float(getattr(sym_info, 'volume_min', 0.01), 0.01)
+        max_lot  = min(_safe_float(getattr(sym_info, 'volume_max', 100.0), 100.0), 0.10)
+        lot_step = _safe_float(getattr(sym_info, 'volume_step', 0.01), 0.01)
 
-        min_lot  = getattr(sym_info, 'volume_min', 0.01)
-        max_lot  = min(getattr(sym_info, 'volume_max', 100.0), 0.10)
-        lot_step = getattr(sym_info, 'volume_step', 0.01)
+        if stop_distance <= 0 or contract <= 0:
+            return min_lot
+
+        lot_size = risk_amount / (stop_distance * contract)
 
         if lot_step > 0:
             lot_size = round(round(lot_size / lot_step) * lot_step, 2)
 
         return max(min_lot, min(lot_size, max_lot))
     
+    def _get_signal_generator(self, symbol: str, timeframe: str) -> SignalGenerator:
+        """Return the isolated signal generator for one symbol/timeframe pair."""
+        key = (symbol, timeframe)
+        generator = self.signal_generators.get(key)
+        if generator is None:
+            strategy = EnhancedHFTStrategy(self.strategy_params)
+            generator = SignalGenerator()
+            generator.set_strategy(strategy)
+            self.signal_generators[key] = generator
+        return generator
+
     def process_symbol(self, symbol: str, timeframe: str) -> None:
         """Process trading logic for a symbol."""
         try:
@@ -261,8 +321,8 @@ class EnhancedBot:
                 indicators=indicators
             )
             
-            # Generate signal with enhanced strategy
-            signal = self.signal_generator.analyze_market_data(market_data)
+            # Generate signal with the strategy isolated to this instrument
+            signal = self._get_signal_generator(symbol, timeframe).analyze_market_data(market_data)
             
             if signal:
                 self.signal_count += 1
@@ -359,6 +419,28 @@ class EnhancedBot:
                     tp = round(ref_price * (1 - profit_target_pct), digits)
                     order_type = "SELL"
                 
+                # Risk validation before execution. Quantity is expressed in
+                # units (lots x contract size) so risk math is instrument
+                # independent; stop distance is the actual SL, not a notional
+                # percentage.
+                contract_size = _safe_float(
+                    getattr(sym_info, 'trade_contract_size', 1.0), 1.0
+                ) or 1.0
+                risk_request = OrderRequest(
+                    symbol=symbol,
+                    side=OrderSide.BUY if order_type == "BUY" else OrderSide.SELL,
+                    order_type=OrderType.MARKET,
+                    quantity=Decimal(str(volume)) * Decimal(str(contract_size)),
+                    price=Decimal(str(ref_price)),
+                    stop_loss=Decimal(str(sl)),
+                    take_profit=Decimal(str(tp)),
+                    time_in_force=TimeInForce.GTC,
+                )
+                validation = self.risk_manager.validate_trade(risk_request)
+                if not validation.approved:
+                    logger.warning(f"[RISK] Trade blocked for {symbol}: {validation.reason}")
+                    return
+
                 # Place order
                 logger.info(f"[PLACING] {order_type} {symbol} {volume} lots | SL={sl:.{digits}f} TP={tp:.{digits}f}")
 
@@ -488,20 +570,42 @@ class EnhancedBot:
                 if symbol in self.position_counter:
                     self.position_counter[symbol] = max(0, self.position_counter[symbol] - 1)
                 
-                # Track win/loss based on actual MT5 P&L (Bug 2 fix)
+                # Track win/loss from the broker's realized PnL for this
+                # position and feed it to the performance monitor.
                 order_id = pos_info['order_id']
-                from_date = pos_info['timestamp'] - timedelta(seconds=1)
-                deals = mt5.history_deals_get(from_date, datetime.now(), group=symbol)
-                if deals:
-                    pnl = sum(d.profit for d in deals if d.position_id == order_id)
+                pnl = self.mt_connector.get_realized_pnl(order_id)
+
+                if pnl is None:
+                    logger.warning(
+                        f"No realized P&L available for {symbol} ticket={order_id}; "
+                        "excluding it from performance stats"
+                    )
+                else:
+                    pnl = float(pnl)
                     if pnl > 0:
                         self.win_count += 1
                         logger.info(f"   ✅ WIN (P&L: {pnl:.2f})")
-                    else:
+                    elif pnl < 0:
                         self.loss_count += 1
                         logger.info(f"   ❌ LOSS (P&L: {pnl:.2f})")
-                else:
-                    logger.warning(f"No deal history for {pos_key}, excluding from stats")
+                    else:
+                        logger.info("   ➖ BREAKEVEN (P&L: 0.00)")
+
+                    direction = pos_info.get('direction')
+                    side = (
+                        OrderSide.BUY
+                        if str(getattr(direction, 'value', direction)).upper() == 'BUY'
+                        else OrderSide.SELL
+                    )
+                    self.performance_monitor.record_closed_trade(
+                        symbol=symbol,
+                        side=side,
+                        quantity=pos_info.get('volume', 0),
+                        entry_price=pos_info.get('entry_price'),
+                        gross_pnl=Decimal(str(pnl)),
+                        order_id=order_id,
+                        trade_id=pos_key,
+                    )
                 
                 del self.open_positions[pos_key]
             
@@ -540,6 +644,13 @@ class EnhancedBot:
                 logger.info(f"Signals Generated: {self.signal_count}")
                 logger.info(f"Trades Placed:    {self.trade_count}")
                 logger.info(f"Win Rate:         {win_rate:.1f}% ({self.win_count}W / {self.loss_count}L)")
+
+                perf = self.performance_monitor.get_real_time_metrics()
+                if perf.get('total_trades'):
+                    logger.info(
+                        f"Realized P&L:     ${perf['total_pnl']:.2f} "
+                        f"(profit factor {perf['profit_factor']:.2f})"
+                    )
                 logger.info("=" * 70)
         except Exception as e:
             logger.error(f"Error logging status: {e}")
@@ -563,6 +674,10 @@ class EnhancedBot:
                 logger.info(f"Account: {account_info['login']}")
                 logger.info(f"Balance: {account_info['balance']} USD")
 
+            # Baseline daily risk tracking on live equity now that we are
+            # connected (the constructor runs before connect()).
+            self.risk_manager.reset_daily_baseline()
+
             # Sync any existing open positions before starting the loop
             self._sync_positions_from_broker()
 
@@ -582,6 +697,17 @@ class EnhancedBot:
 
                 try:
                     self.session_manager.update_session()
+
+                    # Enforce stops and portfolio-level risk limits before
+                    # looking for new entries.
+                    self.risk_manager.monitor_positions()
+                    if self.risk_manager.emergency_stop_active:
+                        logger.critical(
+                            "Emergency stop active — halting the trading loop and "
+                            "closing positions"
+                        )
+                        self.running = False
+                        break
 
                     for symbol in self.config.trading.symbols:
                         for timeframe in self.config.trading.timeframes:
